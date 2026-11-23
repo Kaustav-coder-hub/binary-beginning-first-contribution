@@ -1,0 +1,110 @@
+name: Validate first contributions
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review]
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate changed files and provide feedback
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const pr = context.payload.pull_request;
+            const issue_number = pr.number;
+            const errors = [];
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner, repo, pull_number: issue_number, per_page: 100
+            });
+            if (files.length !== 1) {
+              errors.push("Submit exactly one new contributor Markdown file.");
+            }
+            const expected = `contributors/${pr.user.login}.md`;
+            for (const file of files) {
+              if (file.status !== "added") {
+                errors.push(`Only new files are allowed (found: ${file.filename}).`);
+              }
+              if (file.filename !== expected) {
+                errors.push(`Use the filename \`${expected}\` (found: \`${file.filename}\`).`);
+              }
+              if (file.additions > 30 || file.changes > 30) {
+                errors.push("Keep your introduction to 30 lines or fewer.");
+              }
+              if (file.status === "added" && file.filename === expected) {
+                const blob = await github.rest.git.getBlob({
+                  owner, repo, file_sha: file.sha
+                });
+                if (blob.data.size > 3000) {
+                  errors.push("Keep your introduction under 3 KB.");
+                } else {
+                  const content = Buffer.from(blob.data.content, "base64").toString("utf8");
+                  if (!content.trim() || content.trim().split(/\r?\n/).length < 2) {
+                    errors.push("Include a heading and a short introduction.");
+                  }
+                  if (/(?:[\w.+-]+@[\w.-]+\.[A-Za-z]{2,})|(?:\+?\d[\d\s()-]{8,}\d)/.test(content)) {
+                    errors.push("Remove email addresses or phone-number-like strings to protect your privacy.");
+                  }
+                }
+              }
+            }
+            const valid = errors.length === 0;
+            const desiredLabel = valid ? "first-contribution" : "needs-changes";
+            const oldLabel = valid ? "needs-changes" : "first-contribution";
+            const labelColors = {
+              "first-contribution": "2DA44E",
+              "needs-changes": "D73A4A"
+            };
+            for (const name of Object.keys(labelColors)) {
+              try {
+                await github.rest.issues.getLabel({owner, repo, name});
+              } catch (error) {
+                if (error.status !== 404) throw error;
+                try {
+                  await github.rest.issues.createLabel({
+                    owner, repo, name, color: labelColors[name],
+                    description: "Automated workshop submission validation"
+                  });
+                } catch (creationError) {
+                  if (creationError.status !== 422) throw creationError;
+                }
+              }
+            }
+            try {
+              await github.rest.issues.removeLabel({owner, repo, issue_number, name: oldLabel});
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+            await github.rest.issues.addLabels({
+              owner, repo, issue_number, labels: [desiredLabel]
+            });
+            const marker = "<!-- binary-beginning-validation -->";
+            const message = valid
+              ? "✅ **Validation passed!** Your contribution follows the workshop format. A maintainer will review it before merging."
+              : "⚠️ **Changes needed before review:**\n" + errors.map(e => "- " + e).join("\n");
+            const body = marker + "\n" + message +
+              "\n\n_This is an automated format check, not approval or a guarantee of merge._";
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number, per_page: 100
+            });
+            const previous = comments.find(c =>
+              c.user?.type === "Bot" && c.body?.includes(marker)
+            );
+            if (previous) {
+              await github.rest.issues.updateComment({
+                owner, repo, comment_id: previous.id, body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number, body
+              });
+            }
+            if (!valid) core.setFailed("Contribution format validation failed.");
